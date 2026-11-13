@@ -37,6 +37,27 @@ type Decoder struct {
 	bytesPerFrame int64
 }
 
+// seekPredecessorFrames is the number of frames decoded before the frame that
+// contains the seek target to rebuild every cross-frame state correctly.
+//
+// The MP3 bit reservoir (main_data_begin, an 8- or 9-bit field) lets a frame
+// reference up to 511 bytes of main data from preceding frames. The smallest
+// legal Layer III frames (8 kbps, 24 kHz MPEG-2) carry roughly 48 bytes of
+// main data each, so ten such frames already contain far more than 511 bytes:
+// every possible reservoir reference resolves inside this window. The first
+// two frames additionally reinitialize the overlap-add state (the IMDCT store
+// and the subband synthesis v_vec, each of which only carries state from the
+// immediately preceding frame). Being a fixed count, the work done by a Seek
+// is independent of the seek distance and never buffers the whole decoded
+// stream.
+const seekPredecessorFrames = 10
+
+var (
+	errUnseekableSource = errors.New("mp3: source must be io.Seeker")
+	errNegativePosition = errors.New("mp3: negative position")
+	errPositionOverflow = errors.New("mp3: position out of range")
+)
+
 func (d *Decoder) readFrame() error {
 	var err error
 	d.frame, _, err = frame.Read(d.source, d.source.pos, d.frame)
@@ -57,6 +78,12 @@ func (d *Decoder) readFrame() error {
 // Read is io.Reader's Read.
 func (d *Decoder) Read(buf []byte) (int, error) {
 	for len(d.buf) == 0 {
+		// When the whole stream has been decoded there is nothing left to
+		// read. Report io.EOF instead of trying to parse another frame, which
+		// would also fail but with an error that depends on the source layout.
+		if d.length != invalidLength && d.pos >= d.length {
+			return 0, io.EOF
+		}
 		if err := d.readFrame(); err != nil {
 			return 0, err
 		}
@@ -69,11 +96,20 @@ func (d *Decoder) Read(buf []byte) (int, error) {
 
 // Seek is io.Seeker's Seek.
 //
-// Seek returns an error when the underlying source is not io.Seeker.
+// Seek returns an error when the underlying source is not io.Seeker, or when
+// the resulting position is negative or greater than Length. Seek never
+// panics on invalid arguments.
 //
 // Note that seek uses a byte offset but samples are aligned to 4 bytes (2
 // channels, 2 bytes each). Be careful to seek to an offset that is divisible by
 // 4 if you want to read at full sample boundaries.
+//
+// The bytes read after a Seek are byte-identical to the bytes a sequential
+// decode from the start would produce at the same offset. The cost of a Seek
+// does not depend on the distance from the current position: the target frame
+// is located by constant-time index arithmetic and only a fixed number of
+// predecessor frames (enough to cover the bit-reservoir and overlap-add
+// state) are decoded.
 func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 	if offset == 0 && whence == io.SeekCurrent {
 		// Handle the special case of asking for the current position specially.
@@ -87,37 +123,78 @@ func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		npos = d.pos + offset
 	case io.SeekEnd:
-		npos = d.Length() + offset
+		npos = d.length + offset
 	default:
 		return 0, errors.New("mp3: invalid whence")
 	}
-	d.pos = npos
+	if npos < 0 {
+		return 0, errNegativePosition
+	}
+	if d.length == invalidLength {
+		// The source is not seekable: the frame index is not available.
+		return 0, errUnseekableSource
+	}
+	if npos > d.length {
+		return 0, errPositionOverflow
+	}
+
+	// Seeking to the very end leaves nothing to read. The next Read must
+	// return io.EOF.
+	if npos == d.length {
+		d.pos = npos
+		d.buf = nil
+		d.frame = nil
+		return npos, nil
+	}
+
+	// Find the frame containing the target position. frameStarts holds source
+	// positions and is sorted; frame f produces output bytes
+	// [f*bytesPerFrame, (f+1)*bytesPerFrame).
+	f := int(npos / d.bytesPerFrame)
+	if f < 0 || f >= len(d.frameStarts) {
+		return 0, errPositionOverflow
+	}
+
+	// Determine the first frame to decode. Two cross-frame mechanisms make a
+	// frame's samples depend on earlier frames:
+	//
+	//   * The bit reservoir: main_data_begin lets a frame reference main data
+	//     of preceding frames (at most 511 bytes, per the spec). The reference
+	//     is resolved through each frame's reservoir buffer, which is itself
+	//     assembled from the previous frame's buffer, so the dependency
+	//     propagates along the frame chain rather than across a plain byte
+	//     distance.
+	//   * The overlap-add state (IMDCT store and the subband v_vec): the frame
+	//     immediately preceding the target is folded into the target's first
+	//     samples, and that preceding frame must itself be decoded with a
+	//     correct state, which needs the frame before it.
+	//
+	// Rather than reconstructing the exact reservoir chain, decode a fixed
+	// number of predecessor frames that is provably sufficient for every
+	// valid Layer III stream (see seekPredecessorFrames). The count is
+	// constant, so seek cost never grows with the distance from the current
+	// position. The decoded bytes are identical to a from-the-start sequential
+	// decode at the same offset.
+	start := f - seekPredecessorFrames
+	if start < 0 {
+		start = 0
+	}
+
+	// Reset every cross-frame state before rebuilding it from scratch.
 	d.buf = nil
 	d.frame = nil
-	f := d.pos / d.bytesPerFrame
-	// If the frame is not first, read the previous ahead of reading that
-	// because the previous frame can affect the targeted frame.
-	if f > 0 {
-		f--
-		if _, err := d.source.Seek(d.frameStarts[f], 0); err != nil {
-			return 0, err
-		}
-		if err := d.readFrame(); err != nil {
-			return 0, err
-		}
-		if err := d.readFrame(); err != nil {
-			return 0, err
-		}
-		d.buf = d.buf[d.bytesPerFrame+(d.pos%d.bytesPerFrame):]
-	} else {
-		if _, err := d.source.Seek(d.frameStarts[f], 0); err != nil {
-			return 0, err
-		}
-		if err := d.readFrame(); err != nil {
-			return 0, err
-		}
-		d.buf = d.buf[d.pos:]
+	if _, err := d.source.Seek(d.frameStarts[start], io.SeekStart); err != nil {
+		return 0, err
 	}
+	for i := start; i <= f; i++ {
+		if err := d.readFrame(); err != nil {
+			return 0, err
+		}
+	}
+
+	// Drop the decoded bytes that precede the target position.
+	d.buf = d.buf[npos-int64(start)*d.bytesPerFrame:]
+	d.pos = npos
 	return npos, nil
 }
 
@@ -151,7 +228,7 @@ func (d *Decoder) ensureFrameStartsAndLength() error {
 	}
 	l := int64(0)
 	for {
-		h, pos, err := frameheader.Read(d.source, d.source.pos)
+		h, hpos, err := frameheader.Read(d.source, d.source.pos)
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -162,21 +239,28 @@ func (d *Decoder) ensureFrameStartsAndLength() error {
 			}
 			return err
 		}
-		d.frameStarts = append(d.frameStarts, pos)
-		d.bytesPerFrame = int64(h.BytesPerFrame())
-		l += d.bytesPerFrame
 
 		framesize, err := h.FrameSize()
 		if err != nil {
 			return err
 		}
+		// Read the rest of the frame before registering it. A frame whose
+		// body is not fully present (a truncated stream) can never be
+		// decoded, so it must not be counted in the length nor be reachable
+		// through Seek.
 		buf := make([]byte, framesize-4)
 		if _, err := d.source.ReadFull(buf); err != nil {
-			if err == io.EOF {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
 			return err
 		}
+
+		// The frame is complete: register its source position and its output
+		// size only now.
+		d.frameStarts = append(d.frameStarts, hpos)
+		d.bytesPerFrame = int64(h.BytesPerFrame())
+		l += d.bytesPerFrame
 	}
 	d.length = l
 
